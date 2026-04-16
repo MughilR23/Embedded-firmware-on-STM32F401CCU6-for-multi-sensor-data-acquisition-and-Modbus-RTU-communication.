@@ -1,0 +1,197 @@
+// ── UART ─────────────────────────────────────────
+#define SensorSerial Serial1
+HardwareSerial DebugSerial(PA3, PA2);
+
+// ── ANALOG PINS ──────────────────────────────────
+#define PH_PIN   A0
+#define TDS_PIN  A1
+#define TURB_PIN A4
+
+// ── pH CALIBRATION ───────────────────────────────
+#define PH4_VOLTAGE  2.23f   // ← replace with your pH4 reading
+#define PH7_VOLTAGE  1.65f   // ← replace with your pH7 reading
+float pH_slope     = (7.0f - 4.0f) / (PH7_VOLTAGE - PH4_VOLTAGE);
+float pH_intercept = 7.0f - pH_slope * PH7_VOLTAGE;
+
+// ── ZPHS01B ──────────────────────────────────────
+#define ZPHS_RESP_LEN 26   // ← correct 26 bytes per datasheet
+byte resp[26];
+
+// ── TDS temp compensation ────────────────────────
+float waterTemp = 25.0f;
+
+// ═══════════════════════════════════════════════
+//  VOLTAGE READ
+// ═══════════════════════════════════════════════
+
+float readVoltage(int pin) {
+  long sum = 0;
+  for (int i = 0; i < 10; i++) sum += analogRead(pin);
+  return (sum / 10.0f) * (3.3f / 4095.0f);
+}
+
+// ═══════════════════════════════════════════════
+//  pH
+// ═══════════════════════════════════════════════
+
+float readPH(float v) {
+  float ph = pH_slope * v + pH_intercept;
+  return constrain(ph, 0.0f, 14.0f);
+}
+
+// ═══════════════════════════════════════════════
+//  TDS
+// ═══════════════════════════════════════════════
+
+float readTDS(float v) {
+  float comp = 1.0f + 0.02f * (waterTemp - 25.0f);
+  float cv   = v / comp;
+  return (133.42f * cv * cv * cv
+        - 255.86f * cv * cv
+        + 857.39f * cv) * 0.5f;
+}
+
+// ═══════════════════════════════════════════════
+//  TURBIDITY
+//  Output: 0~4.5V → after 10k/20k divider
+//  multiply back by 1.5 to get real voltage
+// ═══════════════════════════════════════════════
+
+float readTurbidity(float v) {
+  float realV = v * 1.5f;  // ← scale back to real voltage
+  if (realV < 2.5f) return 3000.0f;
+  float ntu = -1120.4f * realV * realV
+              + 5742.3f * realV
+              - 4352.9f;
+  return (ntu < 0.0f) ? 0.0f : ntu;
+}
+
+// ═══════════════════════════════════════════════
+//  ZPHS01B AIR SENSOR — 26 BYTES per datasheet
+// ═══════════════════════════════════════════════
+
+void readAirSensor() {
+  byte cmd[9] = {0xFF, 0x01, 0x86, 0, 0, 0, 0, 0, 0x79};
+
+  // Flush old data
+  while (SensorSerial.available()) SensorSerial.read();
+
+  // Send command
+  SensorSerial.write(cmd, 9);
+  delay(150);
+
+  // Read 26 bytes
+  int i = 0;
+  while (SensorSerial.available() && i < ZPHS_RESP_LEN) {
+    resp[i++] = SensorSerial.read();
+  }
+
+  // Check byte count
+  if (i < 25) {
+    DebugSerial.print("Air Sensor Read Error! Bytes: ");
+    DebugSerial.println(i);
+    return;
+  }
+
+  // Check header
+  if (resp[0] != 0xFF || resp[1] != 0x86) {
+    DebugSerial.println("Bad header!");
+    return;
+  }
+
+  // Verify checksum
+  byte sum = 0;
+  for (int j = 1; j <= 24; j++) sum += resp[j];
+  byte checksum = (~sum) + 1;
+  if (checksum != resp[25]) {
+    DebugSerial.print("Checksum fail! Got: 0x");
+    DebugSerial.print(resp[25], HEX);
+    DebugSerial.print(" Expected: 0x");
+    DebugSerial.println(checksum, HEX);
+    return;
+  }
+
+  // Decode per datasheet
+  int   pm1  = (resp[2]  << 8) | resp[3];
+  int   pm25 = (resp[4]  << 8) | resp[5];
+  int   pm10 = (resp[6]  << 8) | resp[7];
+  int   co2  = (resp[8]  << 8) | resp[9];
+  int   voc  =  resp[10];
+  float temp = (((resp[11] << 8) | resp[12]) - 500) * 0.1f;
+  int   hum  =  (resp[13] << 8) | resp[14];
+  float ch2o = ((resp[15] << 8) | resp[16]) * 0.001f;
+  float co   = ((resp[17] << 8) | resp[18]) * 0.1f;
+  float o3   = ((resp[19] << 8) | resp[20]) * 0.01f;
+  float no2  = ((resp[21] << 8) | resp[22]) * 0.01f;
+
+  // Update water temp compensation
+  waterTemp = temp;
+
+  // Print air data
+  DebugSerial.println("------ AIR DATA ------");
+  DebugSerial.print("  PM1.0     : "); DebugSerial.print(pm1);       DebugSerial.println(" ug/m3");
+  DebugSerial.print("  PM2.5     : "); DebugSerial.print(pm25);      DebugSerial.println(" ug/m3");
+  DebugSerial.print("  PM10      : "); DebugSerial.print(pm10);      DebugSerial.println(" ug/m3");
+  DebugSerial.print("  CO2       : "); DebugSerial.print(co2);       DebugSerial.println(" ppm");
+  DebugSerial.print("  VOC Grade : "); DebugSerial.println(voc);
+  DebugSerial.print("  Temp      : "); DebugSerial.print(temp, 1);   DebugSerial.println(" C");
+  DebugSerial.print("  Humidity  : "); DebugSerial.print(hum);       DebugSerial.println(" %RH");
+  DebugSerial.print("  CH2O      : "); DebugSerial.print(ch2o, 3);   DebugSerial.println(" mg/m3");
+  DebugSerial.print("  CO        : "); DebugSerial.print(co, 1);     DebugSerial.println(" ppm");
+  DebugSerial.print("  O3        : "); DebugSerial.print(o3, 2);     DebugSerial.println(" ppm");
+  DebugSerial.print("  NO2       : "); DebugSerial.print(no2, 2);    DebugSerial.println(" ppm");
+  DebugSerial.println("----------------------");
+}
+
+// ═══════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════
+
+void setup() {
+  pinMode(PC13, OUTPUT);
+  DebugSerial.begin(115200);   // FTDI debug
+  SensorSerial.begin(9600);    // ZPHS01B
+  analogReadResolution(12);
+
+  DebugSerial.println("=================================");
+  DebugSerial.println("  CARBELIM Sensor Test           ");
+  DebugSerial.println("=================================");
+  DebugSerial.println("pH Calibration:");
+  DebugSerial.print("  pH4 V     : "); DebugSerial.println(PH4_VOLTAGE, 3);
+  DebugSerial.print("  pH7 V     : "); DebugSerial.println(PH7_VOLTAGE, 3);
+  DebugSerial.print("  Slope     : "); DebugSerial.println(pH_slope, 4);
+  DebugSerial.print("  Intercept : "); DebugSerial.println(pH_intercept, 4);
+  DebugSerial.println("=================================");
+}
+
+// ═══════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════
+
+void loop() {
+  digitalWrite(PC13, LOW);
+
+  // ── Air sensor ───────────────────────────────
+  readAirSensor();
+
+  // ── Water sensors ────────────────────────────
+  float phV   = readVoltage(PH_PIN);
+  float tdsV  = readVoltage(TDS_PIN);
+  float turbV = readVoltage(TURB_PIN);
+
+  float ph   = readPH(phV);
+  float tds  = readTDS(tdsV);
+  float turb = readTurbidity(turbV);
+
+  DebugSerial.println("------ WATER DATA ------");
+  DebugSerial.print("  pH Voltage  : "); DebugSerial.print(phV,   4); DebugSerial.println(" V");
+  DebugSerial.print("  pH Value    : "); DebugSerial.println(ph,  2);
+  DebugSerial.print("  TDS Voltage : "); DebugSerial.print(tdsV,  3); DebugSerial.println(" V");
+  DebugSerial.print("  TDS         : "); DebugSerial.print(tds,   1); DebugSerial.println(" ppm");
+  DebugSerial.print("  Turb Voltage: "); DebugSerial.print(turbV * 1.5f, 3); DebugSerial.println(" V (real)");
+  DebugSerial.print("  Turbidity   : "); DebugSerial.print(turb,  1); DebugSerial.println(" NTU");
+  DebugSerial.println("------------------------\n");
+
+  digitalWrite(PC13, HIGH);
+  delay(2000);
+}
