@@ -1,0 +1,43 @@
+#include <ModbusRTU.h>
+
+// ================= CONFIG =================
+#define RS485_CTRL PA8
+HardwareSerial rs485Serial(PA3, PA2);  // RX, TX
+
+ModbusRTU mb;
+
+uint16_t testData[5] = {10, 20, 30, 40, 50};
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(RS485_CTRL, OUTPUT);
+  digitalWrite(RS485_CTRL, LOW);
+
+  pinMode(PC13, OUTPUT);
+
+  rs485Serial.begin(9600);
+
+  mb.begin(&rs485Serial, RS485_CTRL);
+  mb.slave(1);
+
+  for (int i = 0; i < 5; i++) {
+    mb.addHreg(i);
+  }
+
+  Serial.println("RS485 MODBUS TEST STARTED");
+}
+
+void loop()
+{
+  mb.task();
+
+  for (int i = 0; i < 5; i++) {
+    mb.Hreg(i, testData[i]);
+  }
+
+  // Blink LED → system alive
+  digitalWrite(PC13, !digitalRead(PC13));
+  delay(500);
+}
